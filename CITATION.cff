@@ -1,6 +1,6 @@
 cff-version: 1.2.0
-message: "Si usas este software, por favor cítalo como se indica a continuación."
-title: "Anti-missile: head tracker de baja latencia con YOLO-pose"
+message: "If you use this software, please cite it as below."
+title: "Head Tracker: low-latency head tracking with YOLO-pose"
 type: software
 authors:
   - given-names: Manex

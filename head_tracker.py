@@ -1,21 +1,21 @@
 """
-head_tracker.py — Detecta personas y dibuja una mira sobre la cabeza en tiempo real,
-diseñado para minimizar la latencia de extremo a extremo.
+head_tracker.py — Detects people and draws a crosshair on their head in real time,
+designed to minimize end-to-end latency.
 
-Pipeline (3 hilos, cada uno se queda solo con el dato más reciente):
-    [captura]    cámara V4L2 ──► último frame + timestamp del DRIVER
-    [inferencia] pre-proceso en GPU + YOLO-pose (FP16, CUDA Graph) ──► NMS
-                 ──► tracker IoU ──► filtro One Euro + predicción ──► mira + HUD
-    [pantalla]   imshow / waitKey / vídeo (hilo principal, no frena la inferencia)
+Pipeline (3 threads, each one keeps only the most recent data):
+    [capture]    V4L2 camera ──► latest frame + DRIVER timestamp
+    [inference]  GPU pre-processing + YOLO-pose (FP16, CUDA Graph) ──► NMS
+                 ──► IoU tracker ──► One Euro filter + prediction ──► crosshair + HUD
+    [display]    imshow / waitKey / video (main thread, never blocks inference)
 
-Uso típico:
+Typical usage:
     python head_tracker.py                         # webcam 0, yolo26n-pose
-    python head_tracker.py --exposure 150          # exposición manual: evita que la cámara baje a 15 fps
-    python head_tracker.py --exposure 150 --brighten 3   # ... y aclara la imagen si queda oscura
+    python head_tracker.py --exposure 150          # manual exposure: keeps the camera from dropping to 15 fps
+    python head_tracker.py --exposure 150 --brighten 3   # ... and brightens the image if it is too dark
     python head_tracker.py --model yolo11n-pose.pt # YOLO11
-    python head_tracker.py --source video.mp4      # probar con un vídeo
+    python head_tracker.py --source video.mp4      # test with a video file
 
-Teclas: q / ESC para salir, p para activar/desactivar la predicción.
+Keys: q / ESC to quit, p to toggle prediction.
 """
 from __future__ import annotations
 
@@ -28,26 +28,26 @@ import time
 import cv2
 import numpy as np
 
-# Índices de keypoints COCO (17 puntos) que devuelve YOLO-pose
+# COCO keypoint indices (17 points) returned by YOLO-pose
 NOSE, L_EYE, R_EYE, L_EAR, R_EAR, L_SH, R_SH = 0, 1, 2, 3, 4, 5, 6
 HEAD_KPTS = np.array([NOSE, L_EYE, R_EYE, L_EAR, R_EAR])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Captura: un hilo que SOLO guarda el último frame
+# 1. Capture: a thread that ONLY keeps the latest frame
 # ─────────────────────────────────────────────────────────────────────────────
 class LatestFrameGrabber:
-    """Lee la cámara en un hilo aparte y se queda solo con el frame más nuevo.
+    """Reads the camera in a separate thread and keeps only the newest frame.
 
-    Por qué: si lees con cap.read() en el mismo bucle que la inferencia, y la
-    inferencia tarda más que el periodo de la cámara, los frames se acumulan en el
-    buffer del driver y acabas procesando imágenes de hace 100-300 ms. Aquí los
-    frames viejos se descartan: siempre procesas "el presente".
+    Why: if you call cap.read() in the same loop as inference, and inference takes
+    longer than the camera period, frames pile up in the driver buffer and you end
+    up processing images that are 100-300 ms old. Here old frames are dropped: you
+    always process "the present".
 
-    En Linux/V4L2 el timestamp es el que pone el driver al recibir el frame por USB
-    (CLOCK_MONOTONIC, el mismo reloj que time.perf_counter). Llega ~1 periodo de
-    cámara antes que el retorno de cap.read(), así que la latencia medida y la
-    predicción son más realistas.
+    On Linux/V4L2 the timestamp is the one set by the driver when the frame arrives
+    over USB (CLOCK_MONOTONIC, the same clock as time.perf_counter). It is ~1 camera
+    period earlier than the return of cap.read(), so the measured latency and the
+    prediction are more realistic.
     """
 
     def __init__(self, source, width: int, height: int, fps: int, exposure: float | None):
@@ -55,20 +55,20 @@ class LatestFrameGrabber:
         backend = cv2.CAP_V4L2 if (not self.is_file and sys.platform.startswith("linux")) else cv2.CAP_ANY
         self.cap = cv2.VideoCapture(source, backend)
         if not self.is_file:
-            # MJPG permite resoluciones/fps altos por USB 2.0 sin que la cámara baje los fps
+            # MJPG allows high resolutions/fps over USB 2.0 without the camera dropping fps
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
             self.cap.set(cv2.CAP_PROP_FPS, fps)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if exposure is not None:
-                # Con auto-exposición y poca luz muchas webcams alargan la exposición y
-                # bajan a 15 fps: +33 ms de periodo y más desenfoque. Manual lo evita.
-                # En V4L2: 1 = manual; unidades del driver (normalmente 100 µs).
+                # With auto-exposure in low light many webcams lengthen the exposure and
+                # drop to 15 fps: +33 ms per frame and more motion blur. Manual avoids it.
+                # On V4L2: 1 = manual; driver units (usually 100 µs).
                 self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
                 self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
         if not self.cap.isOpened():
-            raise RuntimeError(f"No se pudo abrir la fuente de vídeo: {source}")
+            raise RuntimeError(f"Could not open video source: {source}")
         self.driver_ts = backend == cv2.CAP_V4L2
 
         src_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -79,12 +79,12 @@ class LatestFrameGrabber:
         self._frame = None
         self._t = 0.0
         self._seq = 0
-        self.fps = 0.0  # fps reales entregados por la cámara
+        self.fps = 0.0  # actual fps delivered by the camera
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
-        """Arranca la captura (después de cargar el modelo: un vídeo no avanza en vano)."""
+        """Starts capturing (after loading the model, so a video file doesn't play for nothing)."""
         self._thread.start()
         return self
 
@@ -100,7 +100,7 @@ class LatestFrameGrabber:
                 continue
             if self.driver_ts:
                 ts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                if 0.0 <= t - ts < 0.5:  # solo si es del mismo reloj
+                if 0.0 <= t - ts < 0.5:  # only if it comes from the same clock
                     t = ts
             if t_prev is not None:
                 self.fps = 0.9 * self.fps + 0.1 / max(t - t_prev, 1e-6) if self.fps else 1.0 / max(t - t_prev, 1e-6)
@@ -108,14 +108,14 @@ class LatestFrameGrabber:
             with self._cond:
                 self._frame, self._t, self._seq = frame, t, self._seq + 1
                 self._cond.notify_all()
-            if self.is_file:  # simula una cámara real: el vídeo avanza aunque no lo leas
+            if self.is_file:  # emulate a real camera: the video advances even if you don't read it
                 time.sleep(self.file_period)
         with self._cond:
             self.running = False
             self._cond.notify_all()
 
     def read(self, last_seq: int):
-        """Devuelve (frame, t_captura, seq) en cuanto haya uno NUEVO (sin sondeo)."""
+        """Returns (frame, t_capture, seq) as soon as there is a NEW one (no polling)."""
         with self._cond:
             self._cond.wait_for(lambda: self._seq != last_seq or not self.running)
             if self._seq != last_seq:
@@ -137,15 +137,16 @@ class LatestFrameGrabber:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Modelo: YOLO-pose "a pelo" con CUDA Graph
+# 2. Model: bare YOLO-pose with a CUDA Graph
 # ─────────────────────────────────────────────────────────────────────────────
 class PoseNet:
-    """Ejecuta la red de YOLO-pose sin el predictor de ultralytics.
+    """Runs the YOLO-pose network without the ultralytics predictor.
 
-    Una red "nano" en GPU no está limitada por el cómputo sino por Python lanzando
-    ~300 kernels por frame (~14 ms). Con la forma de entrada fija se puede grabar
-    todo (pre-proceso + red) en un CUDA Graph y lanzarlo de una vez (~1-3 ms).
-    El pre-proceso (BGR→RGB, normalizar, redimensionar, letterbox) también va en GPU.
+    A "nano" network on GPU is not compute-bound but bound by Python launching
+    ~300 kernels per frame (~14 ms). With a fixed input shape the whole thing
+    (pre-processing + network) can be recorded into a CUDA Graph and launched at
+    once (~1-3 ms). Pre-processing (BGR→RGB, normalize, resize, letterbox) also
+    runs on the GPU.
     """
 
     def __init__(self, weights: str, frame_hw: tuple[int, int], imgsz: int,
@@ -159,10 +160,10 @@ class PoseNet:
         self.device = torch.device("cuda:0" if self.cuda else "cpu")
         self.dtype = torch.float16 if self.cuda else torch.float32
         if self.cuda:
-            torch.backends.cudnn.benchmark = True  # la forma no cambia: autotuning una vez
+            torch.backends.cudnn.benchmark = True  # the shape never changes: autotune once
 
         yolo = YOLO(weights, task="pose")
-        # YOLO26 trae una cabeza "one-to-one" sin NMS: se elige ANTES de fusionar
+        # YOLO26 ships an NMS-free "one-to-one" head: it must be selected BEFORE fusing
         self.e2e = getattr(yolo.model.model[-1], "one2one_cv2", None) is not None
         if self.e2e:
             yolo.model.end2end = True
@@ -181,7 +182,7 @@ class PoseNet:
         ih, iw = math.ceil(self.nh / stride) * stride, math.ceil(self.nw / stride) * stride
         self.conf, self.iou, self.max_det = conf, iou, max_det
 
-        # Buffers estáticos (el CUDA Graph siempre lee/escribe las mismas direcciones)
+        # Static buffers (the CUDA Graph always reads/writes the same addresses)
         self.src = torch.zeros((H, W, 3), dtype=torch.uint8, device=self.device)
         self.inp = torch.full((1, 3, ih, iw), 114 / 255, dtype=self.dtype, device=self.device)
         if self.cuda:
@@ -193,16 +194,16 @@ class PoseNet:
             if self.cuda and use_graph:
                 try:
                     self._capture_graph()
-                except Exception as e:  # si alguna capa no es capturable, modo normal
-                    print(f"[aviso] CUDA Graph no disponible ({e}); se usa ejecución normal")
+                except Exception as e:  # if some layer can't be captured, fall back to eager mode
+                    print(f"[warning] CUDA Graph not available ({e}); using eager execution")
                     self.graph = None
             if self.graph is None:
                 for _ in range(3):
                     self.out = self._forward()
-        for _ in range(2):  # calienta también el post-proceso (primera llamada lenta)
+        for _ in range(2):  # also warm up the post-processing (first call is slow)
             self(np.zeros((H, W, 3), np.uint8))
-        print(f"[info] modelo={weights}  device={self.device}  dtype={str(self.dtype)[6:]}  "
-              f"entrada={iw}x{ih}  cuda_graph={self.graph is not None}")
+        print(f"[info] model={weights}  device={self.device}  dtype={str(self.dtype)[6:]}  "
+              f"input={iw}x{ih}  cuda_graph={self.graph is not None}")
 
     def _forward(self):
         x = self.src.permute(2, 0, 1).flip(0).unsqueeze(0).to(self.dtype).mul_(1 / 255)  # BGR→RGB, 0-1
@@ -210,7 +211,7 @@ class PoseNet:
             x = self.F.interpolate(x, size=(self.nh, self.nw), mode="bilinear", align_corners=False)
         self.inp[:, :, :self.nh, :self.nw] = x
         y = self.net(self.inp)
-        # (1, 4+nc+17*3, anchors) con NMS pendiente, o (1, max_det, 6+17*3) si es end-to-end
+        # (1, 4+nc+17*3, anchors) with NMS pending, or (1, max_det, 6+17*3) if end-to-end
         return y[0] if isinstance(y, (list, tuple)) else y
 
     def _capture_graph(self):
@@ -218,7 +219,7 @@ class PoseNet:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
-            for _ in range(3):  # warm-up: anchors, cuDNN autotuning, memoria
+            for _ in range(3):  # warm-up: anchors, cuDNN autotuning, memory
                 self._forward()
         torch.cuda.current_stream().wait_stream(s)
         g = torch.cuda.CUDAGraph()
@@ -229,7 +230,7 @@ class PoseNet:
         torch.cuda.synchronize()
 
     def __call__(self, frame: np.ndarray):
-        """Devuelve (boxes xyxy (n,4), scores (n,), kxy (n,17,2), kconf (n,17)) en px del frame."""
+        """Returns (boxes xyxy (n,4), scores (n,), kxy (n,17,2), kconf (n,17)) in frame pixels."""
         torch = self.torch
         with torch.inference_mode():
             if self.cuda:
@@ -242,12 +243,12 @@ class PoseNet:
             else:
                 self.out = self._forward()
 
-            if self.e2e:  # filas: x1 y1 x2 y2 score clase kpts… (ya sin duplicados)
+            if self.e2e:  # rows: x1 y1 x2 y2 score class kpts… (already deduplicated)
                 p = self.out[0]
                 keep = p[:, 4] > self.conf
                 p = p[keep][:self.max_det].float()
                 res = torch.cat((p[:, :5], p[:, 6:]), 1)
-            else:  # filas: cx cy w h scores[nc] kpts… → NMS
+            else:  # rows: cx cy w h scores[nc] kpts… → NMS
                 p = self.out[0].transpose(0, 1)
                 scores = p[:, 4:4 + self.nc].amax(1)
                 keep = scores > self.conf
@@ -259,7 +260,7 @@ class PoseNet:
                     idx = torchvision.ops.nms(boxes, scores, self.iou)[:self.max_det]
                     boxes, scores, p = boxes[idx], scores[idx], p[idx]
                 res = torch.cat((boxes, scores[:, None], p[:, 4 + self.nc:]), 1)
-            # Una sola copia GPU→CPU (una sola sincronización) por frame
+            # A single GPU→CPU copy (a single synchronization) per frame
             res = res.cpu().numpy()
 
         nk, kd = self.kpt_shape
@@ -271,14 +272,14 @@ class PoseNet:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Tracker mínimo por IoU (IDs estables para el filtro de cada persona)
+# 3. Minimal IoU tracker (stable IDs for each person's filter)
 # ─────────────────────────────────────────────────────────────────────────────
 class IoUTracker:
-    """Asociación voraz por IoU entre frames consecutivos.
+    """Greedy IoU association between consecutive frames.
 
-    El ByteTrack de ultralytics hace además compensación de movimiento de cámara con
-    flujo óptico (~10 ms/frame en CPU); con cámara fija no aporta nada y solo
-    necesitamos IDs para el suavizado, así que esto basta (<0,1 ms).
+    The ultralytics ByteTrack also does camera motion compensation with optical
+    flow (~10 ms/frame on CPU); with a fixed camera it adds nothing and we only
+    need IDs for smoothing, so this is enough (<0.1 ms).
     """
 
     def __init__(self, iou_thr: float = 0.3, max_age: float = 0.5):
@@ -321,29 +322,29 @@ class IoUTracker:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Suavizado: filtro One Euro (Casiez et al., CHI 2012)
+# 4. Smoothing: One Euro filter (Casiez et al., CHI 2012)
 # ─────────────────────────────────────────────────────────────────────────────
 class OneEuroFilter:
-    """Paso bajo de primer orden cuya frecuencia de corte crece con la velocidad.
+    """First-order low-pass filter whose cutoff frequency grows with speed.
 
-    - Objeto quieto  → corte bajo (min_cutoff) → mucho suavizado, sin temblor.
-    - Objeto rápido  → corte alto (min_cutoff + beta·|v|) → casi sin retraso.
-    Un EMA con alfa fijo te obliga a elegir entre temblor y lag; este no.
+    - Still object → low cutoff (min_cutoff) → heavy smoothing, no jitter.
+    - Fast object  → high cutoff (min_cutoff + beta·|v|) → almost no lag.
+    A fixed-alpha EMA forces you to choose between jitter and lag; this one doesn't.
 
-    Además expone la velocidad filtrada (self.dx), que se usa para predecir. Su corte
-    (d_cutoff) no debe ser muy bajo: con 1 Hz la velocidad llega ~160 ms tarde y la
-    predicción se queda corta justo cuando más falta hace.
+    It also exposes the filtered velocity (self.dx), used for prediction. Its cutoff
+    (d_cutoff) must not be too low: at 1 Hz the velocity arrives ~160 ms late and the
+    prediction falls short exactly when it is needed most.
     """
 
     def __init__(self, min_cutoff=1.5, beta=0.05, d_cutoff=3.0):
         self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
-        self.x = None          # posición filtrada (px)
-        self.dx = np.zeros(2)  # velocidad filtrada (px/s)
+        self.x = None          # filtered position (px)
+        self.dx = np.zeros(2)  # filtered velocity (px/s)
         self.t = None
 
     @staticmethod
     def _alpha(cutoff: float, dt: float) -> float:
-        # Discretización del RC: tau = 1/(2·pi·fc), alpha = dt/(dt+tau)
+        # RC discretization: tau = 1/(2·pi·fc), alpha = dt/(dt+tau)
         tau = 1.0 / (2.0 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
@@ -363,7 +364,7 @@ class OneEuroFilter:
         return self.x
 
     def predict(self, lead_s: float, max_shift: float) -> np.ndarray:
-        """Extrapolación de velocidad constante: x(t + lead) ≈ x(t) + v·lead (acotada)."""
+        """Constant-velocity extrapolation: x(t + lead) ≈ x(t) + v·lead (clamped)."""
         shift = self.dx * lead_s
         n = float(np.linalg.norm(shift))
         if n > max_shift:
@@ -372,21 +373,21 @@ class OneEuroFilter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Geometría: de keypoints a "centro de la cabeza"
+# 5. Geometry: from keypoints to "head center"
 # ─────────────────────────────────────────────────────────────────────────────
 def head_from_pose(kxy: np.ndarray, kconf: np.ndarray | None, box: np.ndarray, thr: float):
-    """Estima (centro, radio) de la cabeza de una persona.
+    """Estimates the (center, radius) of a person's head.
 
-    Prioridad:
-      1) Media de nariz/ojos/orejas visibles ponderada por confianza.
-      2) Si la cara no se ve (de espaldas, tapada): extrapolar desde los hombros.
-      3) Último recurso: parte superior de la bounding box.
+    Priority:
+      1) Confidence-weighted mean of the visible nose/eyes/ears.
+      2) If the face isn't visible (from behind, occluded): extrapolate from the shoulders.
+      3) Last resort: top of the bounding box.
     """
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
     conf = kconf if kconf is not None else np.ones(len(kxy))
 
-    # Radio aproximado: ~0.35 del ancho de hombros, o fracción de la caja
+    # Approximate radius: ~0.35 of the shoulder width, or a fraction of the box
     sh_ok = conf[L_SH] > thr and conf[R_SH] > thr
     sh_w = float(np.linalg.norm(kxy[L_SH] - kxy[R_SH])) if sh_ok else 0.0
     radius = 0.35 * sh_w if sh_w > 5 else 0.18 * bw
@@ -400,14 +401,14 @@ def head_from_pose(kxy: np.ndarray, kconf: np.ndarray | None, box: np.ndarray, t
 
     if sh_ok:
         mid = (kxy[L_SH] + kxy[R_SH]) / 2
-        # la cabeza queda ~0.75 anchos de hombro por encima del punto medio
-        return mid - np.array([0.0, 0.75 * sh_w]), radius, "hombros"
+        # the head sits ~0.75 shoulder widths above the midpoint
+        return mid - np.array([0.0, 0.75 * sh_w]), radius, "shoulders"
 
-    return np.array([(x1 + x2) / 2, y1 + 0.10 * bh]), radius, "caja"
+    return np.array([(x1 + x2) / 2, y1 + 0.10 * bh]), radius, "box"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. Dibujo
+# 6. Drawing
 # ─────────────────────────────────────────────────────────────────────────────
 def draw_crosshair(img, c, r, color=(0, 255, 0), thick=2):
     cx, cy = int(round(c[0])), int(round(c[1]))
@@ -423,8 +424,8 @@ def draw_crosshair(img, c, r, color=(0, 255, 0), thick=2):
 
 
 def draw_hud(img, lines):
-    # Fondo negro en vez de contorno grueso: en OpenCV 5 el texto con thickness=3 cambia
-    # de espaciado y el "contorno" sale desplazado (texto doble).
+    # Black background instead of a thick outline: in OpenCV 5, text with thickness=3
+    # changes its spacing and the "outline" ends up shifted (doubled text).
     w = max(cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)[0][0] for t in lines)
     cv2.rectangle(img, (4, 4), (16 + w, 10 + 22 * len(lines)), (0, 0, 0), -1)
     y = 22
@@ -438,18 +439,18 @@ def ema(old, new, a=0.1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. Hilo de inferencia
+# 7. Inference thread
 # ─────────────────────────────────────────────────────────────────────────────
 class Stats:
-    """Estado compartido entre el hilo de inferencia y el de pantalla."""
+    """State shared between the inference thread and the display thread."""
 
     def __init__(self, predict: bool):
         self.predict = predict
         self.stop = False
         self.fps = self.inf = self.lat = None
-        self.show_delay = 0.0  # s entre "frame listo" y "frame en pantalla" (EMA)
+        self.show_delay = 0.0  # s between "frame ready" and "frame on screen" (EMA)
         self.cond = threading.Condition()
-        self.out = None  # (frame anotado, t_captura, t_listo, n)
+        self.out = None  # (annotated frame, t_capture, t_ready, n)
 
 
 def inference_loop(args, grab: LatestFrameGrabber, net: PoseNet, st: Stats):
@@ -476,8 +477,8 @@ def inference_loop(args, grab: LatestFrameGrabber, net: PoseNet, st: Stats):
             t_inf = time.perf_counter() - t0
 
             now = time.perf_counter()
-            # Cuánto llegará tarde la mira: captura→ahora + ahora→pantalla (+ extra de
-            # cámara/monitor que no se puede medir). La predicción adelanta eso.
+            # How late the crosshair will be: capture→now + now→screen (+ extra camera/
+            # monitor latency that can't be measured). The prediction compensates for it.
             lead = (now - t_cap) + st.show_delay + extra if st.predict else 0.0
 
             ids = tracker.update(boxes, t_cap) if not args.no_track else [0] * len(boxes)
@@ -487,7 +488,7 @@ def inference_loop(args, grab: LatestFrameGrabber, net: PoseNet, st: Stats):
                 tid = ids[i]
                 if tid:
                     f = filters.setdefault(tid, OneEuroFilter(args.min_cutoff, args.beta, args.d_cutoff))
-                    f(center, t_cap)  # el tiempo relevante es CUÁNDO se tomó la imagen
+                    f(center, t_cap)  # the relevant time is WHEN the image was taken
                     center = f.predict(lead, 2.0 * radius) if st.predict else f.x
 
                 color = (0, 255, 0) if how == "pose" else (0, 165, 255)
@@ -503,16 +504,16 @@ def inference_loop(args, grab: LatestFrameGrabber, net: PoseNet, st: Stats):
             st.inf = ema(st.inf, t_inf * 1000)
             t_prev = now
             draw_hud(frame, [
-                f"FPS {st.fps:5.1f}  (camara {grab.fps:4.1f})",
-                f"inferencia {st.inf:5.1f} ms",
-                f"captura->pantalla {st.lat or 0:5.1f} ms",
-                f"prediccion {'ON' if st.predict else 'OFF'} (p)",
+                f"FPS {st.fps:5.1f}  (camera {grab.fps:4.1f})",
+                f"inference {st.inf:5.1f} ms",
+                f"capture->display {st.lat or 0:5.1f} ms",
+                f"prediction {'ON' if st.predict else 'OFF'} (p)",
             ])
 
             n += 1
             if n == 60 and not grab.is_file and grab.fps < 0.8 * grab.req_fps:
-                print(f"[aviso] la cámara solo entrega {grab.fps:.1f} fps de {grab.req_fps:.0f}: probablemente "
-                      f"la auto-exposición alarga la exposición. Prueba --exposure 150 (y --brighten 2-3).")
+                print(f"[warning] the camera only delivers {grab.fps:.1f} of {grab.req_fps:.0f} fps: auto-exposure "
+                      f"is probably lengthening the exposure. Try --exposure 150 (and --brighten 2-3).")
             with st.cond:
                 st.out = (frame, t_cap, time.perf_counter(), n)
                 st.cond.notify_all()
@@ -525,40 +526,40 @@ def inference_loop(args, grab: LatestFrameGrabber, net: PoseNet, st: Stats):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. Principal: pantalla / vídeo en el hilo principal (HighGUI lo prefiere así)
+# 8. Main: display / video on the main thread (HighGUI prefers it that way)
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--source", default="0", help="índice de cámara (0, 1…) o ruta de vídeo")
+    ap.add_argument("--source", default="0", help="camera index (0, 1…) or video path")
     ap.add_argument("--model", default="yolo26n-pose.pt", help="yolo26n/s/m-pose.pt, yolo11n-pose.pt…")
-    ap.add_argument("--imgsz", type=int, default=640, help="lado largo de entrada de la red")
-    ap.add_argument("--width", type=int, default=640, help="ancho pedido a la cámara")
-    ap.add_argument("--height", type=int, default=480, help="alto pedido a la cámara")
-    ap.add_argument("--fps", type=int, default=60, help="fps pedidos a la cámara")
+    ap.add_argument("--imgsz", type=int, default=640, help="long side of the network input")
+    ap.add_argument("--width", type=int, default=640, help="width requested from the camera")
+    ap.add_argument("--height", type=int, default=480, help="height requested from the camera")
+    ap.add_argument("--fps", type=int, default=60, help="fps requested from the camera")
     ap.add_argument("--exposure", type=float, default=None,
-                    help="exposición manual (V4L2: unidades de 100 µs, p.ej. 150 = 15 ms)")
-    ap.add_argument("--brighten", type=float, default=1.0, help="ganancia digital si la imagen queda oscura")
-    ap.add_argument("--conf", type=float, default=0.4, help="confianza mínima de detección")
-    ap.add_argument("--iou", type=float, default=0.6, help="IoU del NMS")
+                    help="manual exposure (V4L2: units of 100 µs, e.g. 150 = 15 ms)")
+    ap.add_argument("--brighten", type=float, default=1.0, help="digital gain if the image is too dark")
+    ap.add_argument("--conf", type=float, default=0.4, help="minimum detection confidence")
+    ap.add_argument("--iou", type=float, default=0.6, help="NMS IoU threshold")
     ap.add_argument("--max-det", type=int, default=10)
-    ap.add_argument("--kpt-thr", type=float, default=0.5, help="confianza mínima de keypoint")
-    ap.add_argument("--no-graph", action="store_true", help="desactivar CUDA Graph")
-    ap.add_argument("--no-track", action="store_true", help="sin tracker (sin IDs ni suavizado)")
-    ap.add_argument("--no-predict", action="store_true", help="no compensar la latencia extrapolando")
+    ap.add_argument("--kpt-thr", type=float, default=0.5, help="minimum keypoint confidence")
+    ap.add_argument("--no-graph", action="store_true", help="disable CUDA Graph")
+    ap.add_argument("--no-track", action="store_true", help="no tracker (no IDs or smoothing)")
+    ap.add_argument("--no-predict", action="store_true", help="don't compensate latency by extrapolating")
     ap.add_argument("--extra-lead-ms", type=float, default=0.0,
-                    help="latencia no medible a compensar además (exposición, monitor…)")
-    ap.add_argument("--min-cutoff", type=float, default=1.5, help="One Euro: suavizado en reposo (Hz)")
-    ap.add_argument("--beta", type=float, default=0.05, help="One Euro: reactividad a la velocidad")
-    ap.add_argument("--d-cutoff", type=float, default=3.0, help="One Euro: suavizado de la velocidad (Hz)")
-    ap.add_argument("--no-show", action="store_true", help="no abrir ventana (benchmark)")
-    ap.add_argument("--save", default="", help="guardar el resultado en este .mp4")
+                    help="additional unmeasurable latency to compensate (exposure, monitor…)")
+    ap.add_argument("--min-cutoff", type=float, default=1.5, help="One Euro: smoothing at rest (Hz)")
+    ap.add_argument("--beta", type=float, default=0.05, help="One Euro: responsiveness to speed")
+    ap.add_argument("--d-cutoff", type=float, default=3.0, help="One Euro: velocity smoothing (Hz)")
+    ap.add_argument("--no-show", action="store_true", help="don't open a window (benchmark)")
+    ap.add_argument("--save", default="", help="save the output to this .mp4")
     ap.add_argument("--max-frames", type=int, default=0)
     args = ap.parse_args()
 
     source = int(args.source) if args.source.isdigit() else args.source
     grab = LatestFrameGrabber(source, args.width, args.height, args.fps, args.exposure)
     W, H, cam_fps = grab.props()
-    print(f"[info] cámara {W}x{H} @ {cam_fps:.0f} fps (pedido)")
+    print(f"[info] camera {W}x{H} @ {cam_fps:.0f} fps (requested)")
     net = PoseNet(args.model, (H, W), args.imgsz, args.conf, args.iou, args.max_det, not args.no_graph)
     grab.start()
 
@@ -576,7 +577,7 @@ def main():
             with st.cond:
                 st.cond.wait_for(lambda: st.stop or (st.out is not None and st.out[3] != last_n))
                 if st.out is None or st.out[3] == last_n:
-                    break  # parado y sin frame nuevo
+                    break  # stopped and no new frame
                 frame, t_cap, t_ready, last_n = st.out
             if not args.no_show:
                 cv2.imshow("head tracker", frame)
@@ -588,7 +589,7 @@ def main():
             t_shown = time.perf_counter()
             st.show_delay = 0.9 * st.show_delay + 0.1 * (t_shown - t_ready)
             st.lat = ema(st.lat, (t_shown - t_cap) * 1000)
-            if writer is not None:  # después de mostrar: no retrasa la pantalla
+            if writer is not None:  # after displaying: doesn't delay the screen
                 writer.write(frame)
     except KeyboardInterrupt:
         pass
@@ -601,8 +602,8 @@ def main():
         if not args.no_show:
             cv2.destroyAllWindows()
         if st.inf is not None:
-            print(f"[resumen] {last_n} frames | FPS≈{st.fps:.1f} | inferencia≈{st.inf:.1f} ms "
-                  f"| captura→pantalla≈{st.lat or 0:.1f} ms")
+            print(f"[summary] {last_n} frames | FPS≈{st.fps:.1f} | inference≈{st.inf:.1f} ms "
+                  f"| capture→display≈{st.lat or 0:.1f} ms")
 
 
 if __name__ == "__main__":

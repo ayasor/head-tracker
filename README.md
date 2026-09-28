@@ -1,83 +1,83 @@
-# Anti-missile — head tracker de baja latencia
+# Head Tracker — low-latency head tracking
 
-Proyecto de Computer Vision (UPF). Detecta personas con la webcam y dibuja en tiempo real una
-mira sobre su cabeza, con el objetivo de **minimizar la latencia de extremo a extremo**
-(captura → pantalla).
+Computer Vision project (UPF). Detects people with a webcam and draws a crosshair on their
+head in real time, with the goal of **minimizing end-to-end latency** (capture → display).
 
-## Cómo funciona
+## How it works
 
 ```
-[captura]    cámara V4L2 ──► último frame + timestamp del driver
-[inferencia] pre-proceso en GPU + YOLO-pose (FP16, CUDA Graph) ──► NMS / end-to-end
-             ──► tracker IoU ──► filtro One Euro + predicción ──► mira + HUD
-[pantalla]   imshow / waitKey / vídeo (hilo principal, no frena la inferencia)
+[capture]    V4L2 camera ──► latest frame + driver timestamp
+[inference]  GPU pre-processing + YOLO-pose (FP16, CUDA Graph) ──► NMS / end-to-end
+             ──► IoU tracker ──► One Euro filter + prediction ──► crosshair + HUD
+[display]    imshow / waitKey / video (main thread, never blocks inference)
 ```
 
-- **Captura en un hilo propio** que solo conserva el frame más reciente: nunca se procesan
-  imágenes viejas del buffer del driver.
-- **Inferencia con CUDA Graph**: una red *nano* en GPU está limitada por Python lanzando
-  cientos de kernels, no por el cómputo. Grabando pre-proceso + red en un grafo la inferencia
-  baja de ~14 ms a ~3 ms.
-- **Tracker IoU ligero** en lugar de ByteTrack (que con ultralytics 8.4 añade ~11 ms de flujo
-  óptico por frame).
-- **Centro de la cabeza** a partir de nariz/ojos/orejas; si no se ven, se estima desde los
-  hombros o la caja.
-- **Filtro One Euro** por persona (sin temblor en reposo, poco retraso en movimiento) y
-  **predicción** por velocidad constante que adelanta la mira lo que tarda en llegar a pantalla.
+- **Capture in its own thread** that only keeps the most recent frame: stale images from the
+  driver buffer are never processed.
+- **Inference with a CUDA Graph**: a *nano* network on GPU is bound by Python launching
+  hundreds of kernels, not by compute. Recording pre-processing + network into a graph brings
+  inference down from ~14 ms to ~3 ms.
+- **Lightweight IoU tracker** instead of ByteTrack (which in ultralytics 8.4 adds ~11 ms of
+  optical flow per frame).
+- **Head center** from the nose/eyes/ears; if they aren't visible, it is estimated from the
+  shoulders or the bounding box.
+- **One Euro filter** per person (no jitter at rest, little lag in motion) and a
+  **constant-velocity prediction** that moves the crosshair ahead by the time it takes to
+  reach the screen.
 
-## Rendimiento
+## Performance
 
-Medido con una RTX 5060 Laptop y webcam 640x480 @ 30 fps:
+Measured on an RTX 5060 Laptop GPU with a 640x480 @ 30 fps webcam:
 
-| | Original | Actual |
+| | Original | Current |
 |---|---|---|
-| FPS | 15 | ~27–29 (límite: la cámara) |
-| Inferencia | 24 ms | ~3 ms |
-| Captura → pantalla (mismo reloj) | ~26 ms | ~10 ms |
+| FPS | 15 | ~27–29 (limited by the camera) |
+| Inference | 24 ms | ~3 ms |
+| Capture → display (same clock) | ~26 ms | ~10 ms |
 
-El HUD mide desde el timestamp del driver V4L2, así que incluye también la transferencia USB
-(~30 ms), que antes no se contaba.
+The HUD measures from the V4L2 driver timestamp, so it also includes the USB transfer
+(~30 ms), which was not counted before.
 
-## Instalación
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Requiere Python 3.10+ y, para ir rápido, una GPU NVIDIA con CUDA. Los pesos
-(`yolo26n-pose.pt`) se descargan solos la primera vez.
+Requires Python 3.10+ and, for full speed, an NVIDIA GPU with CUDA. The weights
+(`yolo26n-pose.pt`) are downloaded automatically on first run.
 
-## Uso
+## Usage
 
 ```bash
 python head_tracker.py                              # webcam 0, yolo26n-pose
-python head_tracker.py --exposure 150 --brighten 3  # exposición manual (evita bajar a 15 fps)
-python head_tracker.py --model yolo11n-pose.pt      # otro modelo
+python head_tracker.py --exposure 150 --brighten 3  # manual exposure (avoids dropping to 15 fps)
+python head_tracker.py --model yolo11n-pose.pt      # a different model
 python head_tracker.py --source video.mp4 --save out.mp4
-python head_tracker.py --no-show --max-frames 300   # benchmark sin ventana
+python head_tracker.py --no-show --max-frames 300   # headless benchmark
 ```
 
-Teclas: `q` / `ESC` salir, `p` activar/desactivar la predicción.
+Keys: `q` / `ESC` to quit, `p` to toggle prediction.
 
-Opciones útiles:
+Useful options:
 
-| Opción | Descripción |
+| Option | Description |
 |---|---|
-| `--exposure N` | Exposición manual (V4L2, unidades de 100 µs). La auto-exposición con poca luz baja la cámara a 15 fps. |
-| `--brighten X` | Ganancia digital si la imagen queda oscura. |
-| `--imgsz N` | Lado largo de la entrada de la red. |
-| `--no-predict` | Desactiva la compensación de latencia. |
-| `--extra-lead-ms N` | Latencia extra (exposición, monitor) a compensar. |
-| `--min-cutoff`, `--beta`, `--d-cutoff` | Parámetros del filtro One Euro. |
-| `--no-graph` | Desactiva CUDA Graph. |
+| `--exposure N` | Manual exposure (V4L2, units of 100 µs). Auto-exposure in low light drops the camera to 15 fps. |
+| `--brighten X` | Digital gain if the image is too dark. |
+| `--imgsz N` | Long side of the network input. |
+| `--no-predict` | Disables latency compensation. |
+| `--extra-lead-ms N` | Extra latency (exposure, monitor) to compensate for. |
+| `--min-cutoff`, `--beta`, `--d-cutoff` | One Euro filter parameters. |
+| `--no-graph` | Disables the CUDA Graph. |
 
-`python head_tracker.py --help` muestra todas.
+`python head_tracker.py --help` lists all of them.
 
-## Citar
+## Citation
 
-Ver [`CITATION.cff`](CITATION.cff) (GitHub muestra el botón *Cite this repository*).
+See [`CITATION.cff`](CITATION.cff) (GitHub shows a *Cite this repository* button).
 
-## Licencia
+## License
 
-[MIT](LICENSE). Nota: usa [Ultralytics YOLO](https://github.com/ultralytics/ultralytics),
-que se distribuye bajo AGPL-3.0.
+[MIT](LICENSE). Note: this project uses [Ultralytics YOLO](https://github.com/ultralytics/ultralytics),
+which is distributed under AGPL-3.0.
