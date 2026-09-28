@@ -5,7 +5,7 @@ type: software
 authors:
   - given-names: Manex
     email: manex.stako@gmail.com
-repository-code: "https://github.com/ayasor/Anti-missile"
+repository-code: "https://github.com/ayasor/head-tracker"
 license: MIT
 version: 1.0.0
 date-released: 2026-09-28
