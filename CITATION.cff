@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "Si usas este software, por favor cítalo como se indica a continuación."
+title: "Anti-missile: head tracker de baja latencia con YOLO-pose"
+type: software
+authors:
+  - given-names: Manex
+    email: manex.stako@gmail.com
+repository-code: "https://github.com/ayasor/Anti-missile"
+license: MIT
+version: 1.0.0
+date-released: 2026-09-28
+keywords:
+  - computer vision
+  - pose estimation
+  - YOLO
+  - real-time tracking
+  - low latency
+references:
+  - type: software
+    title: "Ultralytics YOLO"
+    authors:
+      - family-names: Jocher
+        given-names: Glenn
+      - family-names: Qiu
+        given-names: Jing
+    repository-code: "https://github.com/ultralytics/ultralytics"
+    license: AGPL-3.0
+  - type: conference-paper
+    title: "1€ Filter: A Simple Speed-based Low-pass Filter for Noisy Input in Interactive Systems"
+    authors:
+      - family-names: Casiez
+        given-names: Géry
+      - family-names: Roussel
+        given-names: Nicolas
+      - family-names: Vogel
+        given-names: Daniel
+    collection-title: "Proceedings of the SIGCHI Conference on Human Factors in Computing Systems (CHI '12)"
+    year: 2012
+    doi: 10.1145/2207676.2208639
