@@ -1,6 +1,6 @@
 # Head Tracker — low-latency head tracking
 
-Computer Vision project (UPF). Detects people with a webcam and draws a crosshair on their
+Computer Vision project. Detects people with a webcam and draws a crosshair on their
 head in real time, with the goal of **minimizing end-to-end latency** (capture → display).
 
 ## How it works
